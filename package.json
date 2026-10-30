@@ -1,0 +1,13 @@
+{
+  "name": "helmian-spoke",
+  "version": "1.0.3",
+  "description": "Helmian Spoke: the small local agent that pairs a Windows PC with Helmian and runs approved work on it.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "bin": { "hands-spoke": "./bin/hands-spoke.mjs" },
+  "scripts": {
+    "check": "node --check bin/hands-spoke.mjs && node --check src/hands/hidden-input.mjs && node --check src/hands/pc-spoke.mjs && node --check src/hands/root-grants.mjs && node --check src/hands/provider-cli.mjs && node --check hands-mcp/src/shared/protocol.mjs && node --check spoke-installer/install-pair.mjs"
+  }
+}

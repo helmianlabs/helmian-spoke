@@ -1,0 +1,711 @@
+// Helmian hands: the PC spoke. Runs on Troy's PC inside the HelmianBridge
+// service (started by bin/pc-bridge.mjs when hands are configured) or alone:
+//   node bin/hands-spoke.mjs pair      (once; asks for the hands passphrase)
+//   node bin/hands-spoke.mjs           (run)
+//
+// OUTBOUND ONLY: it long-polls the hands MCP server on Hetzner; nothing on the
+// PC listens on a port.
+//
+// THE PC DOES NOT TRUST THE HUB ALONE. For every mutating job it re-verifies the
+// Executive Guard decision itself, against a Guard public key pinned in the
+// LOCAL config (guardPublicKeyX). No pinned key => every mutating job is refused,
+// whatever the hub says. Read-only jobs are confined to the configured workspace
+// roots and refuse secret-looking paths.
+//
+// WORKSPACE ROOTS ARE TWO TIERS. The roots in the local config are the built-in
+// default roots (read + Guard-approved write). Extra folders arrive only as
+// signed root grants in roots.grants.json (see root-grants.mjs): each grant is
+// re-verified against the same pinned Guard key on every load, names ONE
+// absolute folder, is bound to this spoke device, and is READ-ONLY — mutating
+// tools refuse under a granted root even with a valid Guard approval. Removing
+// a grant from the file revokes it; the executor reloads grants per operation.
+
+import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { constants as fsConstants } from 'node:fs';
+import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir, hostname, platform, tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { MAX_OUTPUT_BYTES, PHONE_COMMANDS, TOOLS, cleanScopeSummary, validateArgs, verifyApproval } from '../../hands-mcp/src/shared/protocol.mjs';
+import { defaultRootGrantsPath, loadRootGrants } from './root-grants.mjs';
+
+export { defaultRootGrantsPath } from './root-grants.mjs';
+
+export const DEFAULT_HANDS_URL = 'https://hands.5-78-222-178.sslip.io';
+
+export function defaultSpokeDeviceId() {
+  return `pc-${hostname()}`.toLowerCase().slice(0, 60);
+}
+
+export function defaultConfigPath() {
+  const base = process.env.APPDATA || join(homedir(), 'AppData', 'Roaming');
+  return join(base, 'Helmian', 'hands-spoke.json');
+}
+
+export function defaultUsedDecisionsPath() {
+  return join(dirname(defaultConfigPath()), 'hands-used-decisions.json');
+}
+
+/**
+ * Single-use Guard decisions, file-backed so a restart inside the 300 s decision
+ * window cannot replay one. Recorded (and flushed to disk) BEFORE the action runs;
+ * if the record cannot be written the action is refused (fail closed).
+ */
+export function createUsedDecisionStore({ path = null, now = Date.now } = {}) {
+  const used = new Map(); // decisionId -> exp ms
+  let loaded = !path;
+  const prune = () => { for (const [id, exp] of used) if (exp < now()) used.delete(id); };
+  async function load() {
+    if (loaded) return;
+    try {
+      const rows = JSON.parse(await readFile(path, 'utf8'));
+      for (const r of Array.isArray(rows) ? rows : []) if (r?.id && Number.isFinite(r.exp)) used.set(String(r.id), Number(r.exp));
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw new Error(`used-decision record unreadable (${e.message})`);
+    }
+    loaded = true;
+  }
+  async function flush() {
+    if (!path) return;
+    await mkdir(dirname(path), { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify([...used].map(([id, exp]) => ({ id, exp }))), { mode: 0o600 });
+    await rename(tmp, path);
+  }
+  return {
+    /** true = claimed now (persisted); false = already used. Throws if it cannot persist. */
+    async claim(id, expMs) {
+      await load();
+      prune();
+      if (used.has(id)) return false;
+      used.set(id, expMs);
+      try { await flush(); } catch (e) { used.delete(id); throw new Error(`could not record the Guard approval as used (${e.message})`); }
+      return true;
+    },
+    async has(id) { await load(); prune(); return used.has(id); },
+  };
+}
+
+export async function readSpokeConfig(path = defaultConfigPath()) {
+  try {
+    const cfg = JSON.parse(await readFile(path, 'utf8'));
+    if (!cfg?.url || !cfg?.token) return null;
+    return cfg;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Path policy ─────────────────────────────────────────────────────────────
+
+const SECRET_PATH = [
+  /(^|[\\/])\.env(\.[^\\/]*)?$/i, /\.(pem|key|pfx|p12|kdbx|ppk)$/i, /(^|[\\/])id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$/i,
+  /(^|[\\/])\.ssh([\\/]|$)/i, /(^|[\\/])\.aws([\\/]|$)/i, /(^|[\\/])\.git[\\/]config$/i, /(^|[\\/])\.npmrc$/i,
+  /AppData[\\/]Roaming[\\/]Helmian([\\/]|$)/i, /(^|[\\/])Helmion[\\/]Herald([\\/]|$)/i, /secret/i, /credential/i,
+  /(^|[\\/])hands-spoke\.json$/i, /pc-bridge-token\.json$/i, /vault/i,
+];
+
+export function isSecretPath(p) {
+  return SECRET_PATH.some((re) => re.test(p));
+}
+
+function within(root, target, caseInsensitive) {
+  const r = caseInsensitive ? root.toLowerCase() : root;
+  const t = caseInsensitive ? target.toLowerCase() : target;
+  const rel = relative(r, t);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/** Resolve `p` (following symlinks for what exists) and require it inside a root. */
+export async function confinePath(p, roots, { mustExist = true, caseInsensitive = platform() === 'win32' } = {}) {
+  if (!Array.isArray(roots) || !roots.length) throw new Error('No workspace roots are configured on the PC.');
+  const abs = resolve(p);
+  let real;
+  try { real = await realpath(abs); }
+  catch (e) {
+    if (mustExist) throw new Error(`Not found: ${p}`);
+    real = join(await realpath(dirname(abs)).catch(() => { throw new Error(`Folder not found: ${dirname(abs)}`); }), abs.split(sep).pop());
+  }
+  const realRoots = await Promise.all(roots.map((r) => realpath(r).catch(() => resolve(r))));
+  if (!realRoots.some((root) => within(root, real, caseInsensitive))) throw new Error(`Outside the workspace roots: ${p}`);
+  if (isSecretPath(real)) throw new Error(`Refused: ${p} looks like a secrets path.`);
+  return real;
+}
+
+// ─── Execution ───────────────────────────────────────────────────────────────
+
+function cap(text) {
+  const s = String(text ?? '');
+  const buf = Buffer.from(s, 'utf8');
+  return buf.length <= MAX_OUTPUT_BYTES ? s : `${buf.subarray(0, MAX_OUTPUT_BYTES).toString('utf8')}\n…[truncated at 64 KB]`;
+}
+
+function run(file, args, { timeoutMs = 30000, spawnImpl = spawn } = {}) {
+  return new Promise((resolveRun) => {
+    let out = '';
+    let err = '';
+    let child;
+    try { child = spawnImpl(file, args, { shell: false, windowsHide: true }); }
+    catch (e) { resolveRun({ ok: false, error: e.message }); return; }
+    const t = setTimeout(() => { try { child.kill(); } catch {} }, timeoutMs);
+    child.stdout?.on('data', (d) => { if (out.length < MAX_OUTPUT_BYTES * 2) out += d; });
+    child.stderr?.on('data', (d) => { if (err.length < 8192) err += d; });
+    child.on('error', (e) => { clearTimeout(t); resolveRun({ ok: false, error: e.message }); });
+    child.on('close', (code) => { clearTimeout(t); resolveRun(code === 0 ? { ok: true, output: cap(out) } : { ok: false, error: `exit ${code}: ${cap(err || out).slice(0, 2000)}` }); });
+  });
+}
+
+// ─── Phone channel (Broad Spectrum Spoke phone commands) ───────────────────
+// The spoke reaches the Android phone paired with this PC through the
+// Android bridge (adb), always with fixed argument arrays — never a shell,
+// never free text. Every phone command first asks adb which phones are
+// there and uses the first fully-authorized one; no phone (or a phone that
+// has not allowed debugging) is an honest error, never a guess.
+
+function runBinary(file, args, { timeoutMs = 30000, spawnImpl = spawn, maxBytes = 8 * 1024 * 1024 } = {}) {
+  return new Promise((resolveRun) => {
+    const chunks = [];
+    let size = 0;
+    let err = '';
+    let child;
+    try { child = spawnImpl(file, args, { shell: false, windowsHide: true }); }
+    catch (e) { resolveRun({ ok: false, error: e.message }); return; }
+    const t = setTimeout(() => { try { child.kill(); } catch {} }, timeoutMs);
+    child.stdout?.on('data', (d) => { size += d.length; if (size <= maxBytes) chunks.push(d); });
+    child.stderr?.on('data', (d) => { if (err.length < 8192) err += d; });
+    child.on('error', (e) => { clearTimeout(t); resolveRun({ ok: false, error: e.message }); });
+    child.on('close', (code) => { clearTimeout(t); resolveRun(code === 0 ? { ok: true, buffer: Buffer.concat(chunks) } : { ok: false, error: `exit ${code}: ${err.slice(0, 500)}` }); });
+  });
+}
+
+const NO_PHONE = 'no phone found: no Android phone is connected to this PC, or the phone has not allowed USB debugging on it';
+
+async function phoneSerial(spawnImpl) {
+  const r = await run('adb', ['devices'], { spawnImpl });
+  if (!r.ok) return { error: `the Android bridge (adb) did not answer on this PC: ${r.error}` };
+  const serials = r.output.split(/\r?\n/).map((l) => l.trim()).filter((l) => /\tdevice$/.test(l)).map((l) => l.split(/\s+/)[0]);
+  if (!serials.length) return { error: NO_PHONE };
+  return { serial: serials[0], count: serials.length };
+}
+
+async function phoneStatus(spawnImpl) {
+  const found = await phoneSerial(spawnImpl);
+  if (found.error) return { ok: false, error: found.error };
+  const s = found.serial;
+  const model = await run('adb', ['-s', s, 'shell', 'getprop', 'ro.product.model'], { spawnImpl });
+  const battery = await run('adb', ['-s', s, 'shell', 'dumpsys', 'battery'], { spawnImpl });
+  const power = await run('adb', ['-s', s, 'shell', 'dumpsys', 'power'], { spawnImpl });
+  const level = /level:\s*(\d+)/.exec(battery.output || '')?.[1];
+  const awake = /mWakefulness=(\w+)/.exec(power.output || '')?.[1];
+  return {
+    ok: true,
+    output: [
+      `phone: connected${found.count > 1 ? ` (${found.count} phones connected; using the first)` : ''}`,
+      `model: ${(model.ok && model.output.trim()) || 'unknown'}`,
+      `battery: ${level ? `${level}%` : 'unknown'}`,
+      `screen: ${awake ? (awake === 'Awake' ? 'on' : 'off') : 'unknown'}`,
+    ].join('\n'),
+  };
+}
+
+function decodeXmlText(s) {
+  return s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#10;/g, ' ').replace(/&amp;/g, '&');
+}
+
+function layoutLines(xml) {
+  const lines = [];
+  const nodeRe = /<node\b([^>]*?)\/?>/g;
+  let m;
+  while ((m = nodeRe.exec(xml)) && lines.length < 120) {
+    const attrs = {};
+    for (const am of m[1].matchAll(/([\w-]+)="([^"]*)"/g)) attrs[am[1]] = am[2];
+    const text = decodeXmlText((attrs.text || '').trim());
+    const desc = decodeXmlText((attrs['content-desc'] || '').trim());
+    const cls = (attrs.class || '').split('.').pop() || '';
+    if (!text && !desc && attrs.clickable !== 'true') continue;
+    const kind = /Button/.test(cls) ? 'button' : /EditText/.test(cls) ? 'field' : /CheckBox/.test(cls) ? 'checkbox' : /TextView/.test(cls) ? 'text' : (cls.toLowerCase() || 'item');
+    lines.push(`${kind}${(text || desc) ? ` "${text || desc}"` : ''} at ${attrs.bounds || '?'}`);
+  }
+  return lines;
+}
+
+// Shrink a screencap PNG (already on disk at pngPath) to a small JPEG and
+// print ONLY its base64. Width is fixed at 540; the quality steps down until
+// the base64 fits the spoke's normal output size, else a marker line says
+// the screen was too dense (phone-layout is then the honest fallback).
+function phoneScreenScript(pngPath) {
+  const q = pngPath.replace(/'/g, "''");
+  return `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Drawing; $img = [System.Drawing.Image]::FromFile('${q}'); $w = 540; $h = [int]($img.Height * $w / $img.Width); $bmp = New-Object System.Drawing.Bitmap $w, $h; $g = [System.Drawing.Graphics]::FromImage($bmp); $g.DrawImage($img, 0, 0, $w, $h); $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }; $b64 = ''; foreach ($quality in @(60, 45, 32, 24)) { $params = New-Object System.Drawing.Imaging.EncoderParameters 1; $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [long]$quality); $ms = New-Object IO.MemoryStream; $bmp.Save($ms, $codec, $params); $b64 = [Convert]::ToBase64String($ms.ToArray()); if ($b64.Length -le 58000) { break } }; if ($b64.Length -gt 58000) { 'SCREEN_TOO_DENSE' } else { $b64 }`;
+}
+
+async function phoneScreen(spawnImpl) {
+  const found = await phoneSerial(spawnImpl);
+  if (found.error) return { ok: false, error: found.error };
+  const shot = await runBinary('adb', ['-s', found.serial, 'exec-out', 'screencap', '-p'], { spawnImpl, timeoutMs: 45000 });
+  if (!shot.ok) return { ok: false, error: `the phone would not give its screen picture: ${shot.error}` };
+  if (!shot.buffer.length) return { ok: false, error: 'the phone returned an empty screen picture (its screen may be off or locked)' };
+  const tmp = join(tmpdir(), `helmian-phone-screen-${process.pid}.png`);
+  try {
+    await writeFile(tmp, shot.buffer);
+    const r = await run('powershell.exe', [...PS, phoneScreenScript(tmp)], { spawnImpl, timeoutMs: 45000 });
+    if (!r.ok) return { ok: false, error: `the screen picture could not be shrunk on the PC: ${r.error}` };
+    const b64 = r.output.trim();
+    if (b64 === 'SCREEN_TOO_DENSE') return { ok: false, error: 'the screen picture is too dense to fit the result size; phone-layout gives the same screen in words' };
+    if (!/^[A-Za-z0-9+/=]+$/.test(b64)) return { ok: false, error: 'the screen picture came back in an unexpected shape' };
+    return { ok: true, output: JSON.stringify({ format: 'jpeg', width: 540, base64: b64 }) };
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
+// adb's on-device typing takes spaces as %s and chokes on shell characters,
+// so the fixed command accepts a plain set only and converts spaces itself.
+function phoneTypeArg(text) {
+  if (!/^[A-Za-z0-9 .,!?@'_\-+/:;()]+$/.test(text)) return null;
+  return text.replace(/ /g, '%s');
+}
+
+const PS = ['-NoProfile', '-NonInteractive', '-Command'];
+const PS_SCRIPTS = {
+  'toolchain-versions': 'foreach ($c in @("node","npm","npx","eas")) { $g = Get-Command $c -ErrorAction SilentlyContinue; if ($g) { $v = & $c --version 2>&1 | Select-Object -First 1; "$c = $v" } else { "$c = MISSING" } }',
+  'disk-free': "Get-PSDrive -PSProvider FileSystem | Select-Object Name,@{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize | Out-String -Width 200",
+  'list-processes': 'Get-Process | Sort-Object CPU -Descending | Select-Object -First 20 Name,Id,@{n="CPU";e={[math]::Round($_.CPU,1)}},@{n="MemMB";e={[math]::Round($_.WorkingSet64/1MB)}} | Format-Table -AutoSize | Out-String -Width 200',
+  // The Bridge's in-process spoke reads hands-spoke.json ONCE at pc-bridge
+  // start and never re-reads it, so the only way to pick up a config change
+  // (e.g. widened roots) is a fresh Bridge. Stop the whole tree (root first,
+  // so the supervisor cannot respawn its children mid-kill; never our own
+  // $PID — when the job runs on the embedded spoke this script is a tree
+  // descendant, and killing our parent does not kill us), wait, relaunch the
+  // service exe detached via Start-Process so it outlives this script, then
+  // report the resulting process state.
+  'restart-bridge': "$name = 'Helmian Bridge Service'; $exe = 'E:\\HelmianService\\Helmian Bridge Service.exe'; $roots = @(Get-Process -Name $name -ErrorAction SilentlyContinue); if ($roots.Count) { $ids = @($roots.Id); $frontier = @($roots.Id); while ($frontier.Count) { $kids = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $frontier -contains $_.ParentProcessId } | Select-Object -ExpandProperty ProcessId | Where-Object { $ids -notcontains $_ }); if (!$kids.Count) { break }; $ids += $kids; $frontier = $kids }; $ids | Where-Object { $_ -ne $PID } | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; Start-Sleep -Seconds 2 }; if (!(Get-Process -Name $name -ErrorAction SilentlyContinue)) { Start-Process -FilePath $exe -WorkingDirectory 'E:\\HelmianService' -WindowStyle Hidden }; Start-Sleep -Seconds 3; $now = @(Get-Process -Name $name -ErrorAction SilentlyContinue); if ($now.Count) { $now | Select-Object Name,Id,StartTime | Format-Table -AutoSize | Out-String -Width 200 } else { 'Helmian Bridge Service is not running after the restart attempt.' }",
+};
+
+function globToRegex(glob) {
+  return new RegExp(`^${glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`, 'i');
+}
+
+export function createExecutor({ roots, grantedRoots = [], rootGrantsPath = null, rootGrantDeviceId = null, rootGrantProvider = null, guardPublicKeyX = null, guardDeviceId = 'hands-mcp', spawnImpl = spawn, fetchImpl = fetch, now = Date.now, usedDecisionsPath = null, usedStore = null } = {}) {
+  const usedDecisions = usedStore || createUsedDecisionStore({ path: usedDecisionsPath, now });
+
+  // Granted roots are reloaded for every file operation, so revoking a grant
+  // (removing it from roots.grants.json) closes access immediately, and a
+  // corrupted or unverifiable grants file grants nothing (fail closed) while
+  // leaving the built-in default roots untouched.
+  const normalizeGranted = (rows) => (Array.isArray(rows) ? rows : [])
+    .map((r) => (typeof r === 'string' ? r : r?.rootPath || r?.path || null))
+    .filter(Boolean);
+  async function currentGrantedRoots() {
+    const granted = [...normalizeGranted(grantedRoots)];
+    try {
+      if (rootGrantProvider) granted.push(...normalizeGranted(await rootGrantProvider()));
+      else if (rootGrantsPath) granted.push(...(await loadRootGrants({ path: rootGrantsPath, publicKeyX: guardPublicKeyX, spokeDeviceId: rootGrantDeviceId, now: now() })).roots);
+    } catch { /* fail closed: no granted roots this operation */ }
+    return [...new Set(granted)];
+  }
+
+  // Mutating jobs return an `execution` record the hub forwards to Executive Guard
+  // (POST /v1/audit/outcomes): refused | succeeded | failed, when it ran, and a SHA-256
+  // of the output. Never the output itself.
+  async function execute(job) {
+    const spec = TOOLS[job?.tool];
+    if (!spec?.mutating) return executeInner(job);
+    const iso = () => new Date(now()).toISOString();
+    let startedAt = null;
+    const result = await executeInner(job, () => { startedAt = iso(); });
+    const finishedAt = iso();
+    if (!startedAt) return { ...result, execution: { status: 'refused', finishedAt, error: result.error || 'refused by the PC' } };
+    const execution = result.ok
+      ? { status: 'succeeded', startedAt, finishedAt, resultHash: createHash('sha256').update(typeof result.output === 'string' ? result.output : JSON.stringify(result.output ?? null)).digest('hex') }
+      : { status: 'failed', startedAt, finishedAt, error: result.error || 'failed' };
+    return { ...result, execution };
+  }
+
+  async function executeInner(job, markStarted = () => {}) {
+    const spec = TOOLS[job?.tool];
+    if (!spec) return { ok: false, error: `unknown tool ${job?.tool}` };
+    let args;
+    try { args = validateArgs(job.tool, job.args); } catch (e) { return { ok: false, error: `bad arguments: ${e.message}` }; }
+
+    // Path confinement for THIS job. Default roots serve every tool; granted
+    // roots serve read-only tools only. A mutating path that fits only a
+    // granted root is a read-only refusal (checked again in the switch via
+    // confineFor, and preflighted below before any Guard decision is spent).
+    const confineFor = async (p, opts = {}) => {
+      try {
+        return await confinePath(p, roots, opts);
+      } catch (defaultError) {
+        const granted = await currentGrantedRoots();
+        if (granted.length) {
+          let grantedReal = null;
+          try { grantedReal = await confinePath(p, granted, opts); } catch { /* not (only) a granted path */ }
+          if (grantedReal) {
+            if (!spec.mutating) return grantedReal;
+            throw new Error(`Refused: ${p} is inside a read-only root grant; mutating tools may only run inside the original workspace roots.`);
+          }
+        }
+        throw defaultError;
+      }
+    };
+    const pathArgsOf = (tool, a) => {
+      switch (tool) {
+        case 'write_file': case 'edit_file': case 'delete_file': case 'make_dir': return [a.path];
+        case 'move_file': case 'copy_file': return [a.path, a.destination];
+        case 'run_powershell': return a.args?.repo ? [a.args.repo] : [];
+        default: return [];
+      }
+    };
+
+    if (spec.mutating) {
+      // Preflight BEFORE Guard verification: a job aimed only at a granted
+      // root can never run, so it must not consume the human's single-use
+      // Guard decision on the way to being refused.
+      for (const p of pathArgsOf(job.tool, args)) {
+        try { await confinePath(p, roots, { mustExist: false }); continue; } catch { /* not a default-root path */ }
+        const granted = await currentGrantedRoots();
+        if (!granted.length) break;
+        try {
+          await confinePath(p, granted, { mustExist: false });
+          return { ok: false, error: `refused by the PC: ${p} is inside a read-only root grant; mutating tools may only run inside the original workspace roots.` };
+        } catch { /* not a granted path either; the normal flow below reports it */ }
+      }
+    }
+
+    if (spec.mutating) {
+      const v = verifyApproval({ publicKeyX: guardPublicKeyX, envelope: job.guardDecision, tool: job.tool, args, nonce: job.nonce, deviceId: guardDeviceId, now: now() });
+      if (!v.ok) return { ok: false, error: `refused by the PC: ${v.error === 'no pinned Guard key' ? 'no Executive Guard key is pinned on this PC, so mutating actions are refused' : `Guard decision did not verify (${v.error})`}` };
+      let claimed;
+      try { claimed = await usedDecisions.claim(v.claims.decisionId, v.claims.exp * 1000); }
+      catch (e) { return { ok: false, error: `refused by the PC: ${e.message}` }; }
+      if (!claimed) return { ok: false, error: 'refused by the PC: that Guard approval was already used' };
+      markStarted();
+    }
+
+    try {
+      switch (job.tool) {
+        case 'list_files': {
+          const dir = await confineFor(args.path);
+          const re = args.glob ? globToRegex(args.glob) : null;
+          const entries = (await readdir(dir, { withFileTypes: true }))
+            .filter((e) => !re || re.test(e.name))
+            .filter((e) => !isSecretPath(join(dir, e.name)))
+            .slice(0, 500)
+            .map((e) => `${e.isDirectory() ? 'd' : '-'} ${e.name}`);
+          return { ok: true, output: cap(`${dir}\n${entries.join('\n') || '(empty)'}`) };
+        }
+        case 'read_file': {
+          const file = await confineFor(args.path);
+          const st = await stat(file);
+          if (!st.isFile()) return { ok: false, error: 'not a file' };
+          const buf = (await readFile(file)).subarray(0, args.maxBytes);
+          if (buf.includes(0)) return { ok: false, error: 'binary file; refused' };
+          return { ok: true, output: cap(buf.toString('utf8') + (st.size > args.maxBytes ? `\n…[${st.size - args.maxBytes} more bytes]` : '')) };
+        }
+        case 'ollama_generate': {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 120000);
+          try {
+            const res = await fetchImpl('http://127.0.0.1:11434/api/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: args.model, prompt: args.prompt, stream: false }), signal: ctrl.signal });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) return { ok: false, error: `ollama ${res.status}: ${body.error || ''}` };
+            return { ok: true, output: cap(body.response || '') };
+          } finally { clearTimeout(t); }
+        }
+        case 'run_powershell': {
+          const { commandId, args: a } = args;
+          if (commandId === 'git-status') return run('git', ['-C', await confineFor(a.repo), 'status', '--short', '--branch'], { spawnImpl });
+          if (commandId === 'git-log') return run('git', ['-C', await confineFor(a.repo), 'log', '--oneline', '-n', String(a.count)], { spawnImpl });
+          if (commandId === 'ollama-list') return run('ollama', ['list'], { spawnImpl });
+          if (commandId === 'eas-build') {
+            // Start the build DETACHED (a real EAS build far outlives the
+            // spoke's 30 s job window): cmd.exe runs the build hidden with
+            // all output redirected into a log in the repo, appending a
+            // HELMIAN_BUILD_EXIT=<code> marker at the end (delayed expansion
+            // via /v:on so the code is read after the build finishes, not
+            // before). eas-build-status reads the log back. Only the
+            // confined repo path varies; it is single-quote-escaped.
+            const repo = await confineFor(a.repo);
+            const q = repo.replace(/'/g, "''");
+            const script = `$repo = '${q}'; $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'; $log = Join-Path $repo (".helmian-eas-build-$stamp.log"); $inner = 'eas build --platform android --profile preview --non-interactive > "' + $log + '" 2>&1 & echo HELMIAN_BUILD_EXIT=!ERRORLEVEL! >> "' + $log + '"'; $p = Start-Process cmd.exe -ArgumentList @('/v:on', '/c', $inner) -WorkingDirectory $repo -WindowStyle Hidden -PassThru; "build started: pid $($p.Id); log: $log"`;
+            return run('powershell.exe', [...PS, script], { spawnImpl });
+          }
+          if (commandId === 'eas-build-status') {
+            const repo = await confineFor(a.repo);
+            const q = repo.replace(/'/g, "''");
+            const script = `$log = Get-ChildItem -LiteralPath '${q}' -Filter '.helmian-eas-build-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1; if (!$log) { 'no spoke-started EAS build log in this repo' } else { "log: $($log.Name) - last write $($log.LastWriteTime)"; Get-Content -LiteralPath $log.FullName -Tail 40 }`;
+            return run('powershell.exe', [...PS, script], { spawnImpl });
+          }
+          if (PS_SCRIPTS[commandId]) return run('powershell.exe', [...PS, PS_SCRIPTS[commandId]], { spawnImpl });
+          return { ok: false, error: 'command not on the PC allow-list' };
+        }
+        case 'phone_look':
+        case 'run_phone': {
+          const { commandId, args: a } = args;
+          const pspec = PHONE_COMMANDS[commandId];
+          if (!pspec || pspec.mutating !== (job.tool === 'run_phone')) return { ok: false, error: 'command not on the PC allow-list' };
+          // Only the screen picture is Windows-shaped (its shrink step is a
+          // PowerShell/.NET one); the rest of the phone channel is pure adb.
+          if (commandId === 'phone-screen' && platform() !== 'win32') return { ok: false, error: 'phone-screen is only wired for Windows PCs' };
+          switch (commandId) {
+            case 'phone-status': return phoneStatus(spawnImpl);
+            case 'phone-screen': return phoneScreen(spawnImpl);
+            case 'phone-layout': {
+              const found = await phoneSerial(spawnImpl);
+              if (found.error) return { ok: false, error: found.error };
+              const dump = await runBinary('adb', ['-s', found.serial, 'exec-out', 'uiautomator', 'dump', '/dev/tty'], { spawnImpl });
+              if (!dump.ok) return { ok: false, error: `the phone would not describe its screen: ${dump.error}` };
+              const lines = layoutLines(dump.buffer.toString('utf8'));
+              return lines.length
+                ? { ok: true, output: cap(lines.join('\n')) }
+                : { ok: false, error: 'the phone described an empty screen (it may be locked or still waking up)' };
+            }
+            case 'phone-tap': {
+              const found = await phoneSerial(spawnImpl);
+              if (found.error) return { ok: false, error: found.error };
+              const r = await run('adb', ['-s', found.serial, 'shell', 'input', 'tap', String(a.x), String(a.y)], { spawnImpl });
+              return r.ok ? { ok: true, output: `tapped at ${a.x}, ${a.y}` } : r;
+            }
+            case 'phone-swipe': {
+              const found = await phoneSerial(spawnImpl);
+              if (found.error) return { ok: false, error: found.error };
+              const r = await run('adb', ['-s', found.serial, 'shell', 'input', 'swipe', String(a.fromX), String(a.fromY), String(a.toX), String(a.toY), '300'], { spawnImpl });
+              return r.ok ? { ok: true, output: `swiped from ${a.fromX}, ${a.fromY} to ${a.toX}, ${a.toY}` } : r;
+            }
+            case 'phone-type': {
+              const found = await phoneSerial(spawnImpl);
+              if (found.error) return { ok: false, error: found.error };
+              const typed = phoneTypeArg(a.text);
+              if (typed == null) return { ok: false, error: "phone-type can only type plain letters, numbers, spaces and . , ! ? @ ' _ - + / : ; ( ) — one of those characters was in the text" };
+              const r = await run('adb', ['-s', found.serial, 'shell', 'input', 'text', typed], { spawnImpl });
+              return r.ok ? { ok: true, output: `typed ${a.text.length} characters` } : r;
+            }
+            default:
+              return { ok: false, error: 'command not on the PC allow-list' };
+          }
+        }
+        case 'open_url': {
+          if (platform() !== 'win32') return { ok: false, error: 'open_url is only wired for Windows' };
+          return run('explorer.exe', [args.url], { spawnImpl }).then((r) => (r.ok || /exit 1/.test(r.error || '') ? { ok: true, output: `Opened ${args.url}` } : r));
+        }
+        case 'write_file': {
+          const file = await confineFor(args.path, { mustExist: false });
+          await writeFile(file, args.content, 'utf8');
+          return { ok: true, output: `Wrote ${Buffer.byteLength(args.content, 'utf8')} bytes to ${file}` };
+        }
+        case 'search_files': {
+          const dir = await confineFor(args.path);
+          if (!(await stat(dir)).isDirectory()) return { ok: false, error: 'not a folder' };
+          const re = args.glob ? globToRegex(args.glob) : null;
+          const needle = args.query ? args.query.toLowerCase() : null;
+          const hits = [];
+          const deadline = Date.now() + 30000;
+          let visited = 0;
+          const walk = async (d) => {
+            if (hits.length >= args.maxResults || visited > 5000 || Date.now() > deadline) return;
+            const entries = await readdir(d, { withFileTypes: true }).catch(() => []);
+            for (const e of entries) {
+              if (hits.length >= args.maxResults || visited > 5000 || Date.now() > deadline) return;
+              visited += 1;
+              const full = join(d, e.name);
+              if (isSecretPath(full)) continue;
+              if (e.isDirectory()) { await walk(full); continue; }
+              if (!e.isFile()) continue;
+              if (re && !re.test(e.name)) continue;
+              if (!needle) { hits.push(full); continue; }
+              const st = await stat(full).catch(() => null);
+              if (!st || st.size > MAX_OUTPUT_BYTES) continue;
+              const buf = await readFile(full).catch(() => null);
+              if (!buf || buf.includes(0)) continue;
+              const lines = buf.toString('utf8').split('\n');
+              for (let i = 0; i < lines.length && hits.length < args.maxResults; i++) {
+                if (lines[i].toLowerCase().includes(needle)) hits.push(`${full}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+              }
+            }
+          };
+          await walk(dir);
+          return { ok: true, output: cap(hits.length ? hits.join('\n') : `No matches under ${dir}`) };
+        }
+        case 'move_file': {
+          const from = await confineFor(args.path);
+          const to = await confineFor(args.destination, { mustExist: false });
+          if (await lstat(to).catch(() => null)) return { ok: false, error: `Destination already exists: ${args.destination}` };
+          await rename(from, to);
+          return { ok: true, output: `Moved ${from} to ${to}` };
+        }
+        case 'copy_file': {
+          const from = await confineFor(args.path);
+          const to = await confineFor(args.destination, { mustExist: false });
+          if (await lstat(to).catch(() => null)) return { ok: false, error: `Destination already exists: ${args.destination}` };
+          if ((await stat(from)).isDirectory()) await cp(from, to, { recursive: true, errorOnExist: true, force: false });
+          else await copyFile(from, to, fsConstants.COPYFILE_EXCL);
+          return { ok: true, output: `Copied ${from} to ${to}` };
+        }
+        case 'delete_file': {
+          const target = await confineFor(args.path);
+          const st = await stat(target);
+          if (st.isDirectory() && !args.recursive) return { ok: false, error: 'That is a folder; pass recursive: true to delete it and everything inside.' };
+          await rm(target, { recursive: !!args.recursive });
+          return { ok: true, output: `Deleted ${target}` };
+        }
+        case 'make_dir': {
+          // Like write_file, the parent folder must already exist: one level only.
+          const dir = await confineFor(args.path, { mustExist: false });
+          if (await lstat(dir).catch(() => null)) return { ok: false, error: `Already exists: ${args.path}` };
+          await mkdir(dir);
+          return { ok: true, output: `Created folder ${dir}` };
+        }
+        case 'edit_file': {
+          const file = await confineFor(args.path);
+          const st = await stat(file);
+          if (!st.isFile()) return { ok: false, error: 'not a file' };
+          if (st.size > MAX_OUTPUT_BYTES) return { ok: false, error: 'file is larger than 64 KB; refused' };
+          const buf = await readFile(file);
+          if (buf.includes(0)) return { ok: false, error: 'binary file; refused' };
+          const text = buf.toString('utf8');
+          const count = text.split(args.find).length - 1;
+          if (count === 0) return { ok: false, error: 'find text not present in the file; nothing changed' };
+          if (count > 1 && !args.all) return { ok: false, error: `find text appears ${count} times; pass all: true to replace every occurrence, or nothing was changed` };
+          const next = args.all ? text.split(args.find).join(args.replace) : text.slice(0, text.indexOf(args.find)) + args.replace + text.slice(text.indexOf(args.find) + args.find.length);
+          if (Buffer.byteLength(next, 'utf8') > MAX_OUTPUT_BYTES) return { ok: false, error: 'the edit would make the file larger than 64 KB; nothing changed' };
+          await writeFile(file, next, 'utf8');
+          return { ok: true, output: `Replaced ${args.all ? count : 1} occurrence(s) in ${file}` };
+        }
+        default:
+          return { ok: false, error: 'not implemented' };
+      }
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  return { execute };
+}
+
+// ─── Scope summary (scope-permission spec, bite 1: reporting) ────────────────
+//
+// The spoke tells the hub its file scope with every poll: the tier it is in,
+// its built-in default roots, and the folders opened by signed root grants.
+// Reporting only — the report grants nothing and widens nothing; enforcement
+// stays here, per operation, exactly as before. The tier comes from the
+// user's recorded pick once pairing writes one (config.scope, bite 4); until
+// then it is derived from the folders actually in force: any folder in force
+// means pick-folders, none at all means no-file-access. full-pc is reported
+// only from an explicit pick — a wide roots list is never dressed up as one.
+
+export function deriveScopeTier({ roots = [], grantRoots = [], scopePick = null } = {}) {
+  switch (scopePick) {
+    case 'full': case 'full-pc': return 'full-pc';
+    case 'none': case 'no-file-access': return 'no-file-access';
+    case 'folders': case 'pick-folders': return 'pick-folders';
+    default: break; // no pick (or an unknown one): derive from what is in force
+  }
+  return roots.length || grantRoots.length ? 'pick-folders' : 'no-file-access';
+}
+
+/**
+ * Build the canonical scope summary for the next poll. Granted folders come
+ * from the same verified load the executor uses — an unverifiable grants file
+ * contributes none (fail closed), exactly as it grants none. Returns null
+ * when the summary cannot be canonicalized (e.g. absurdly many roots): the
+ * caller then polls without a scope field, as spokes always did.
+ */
+export async function buildScopeSummary({ roots = [], rootGrantsPath = null, guardPublicKeyX = null, deviceId = null, scopePick = null, now = Date.now } = {}) {
+  let grantRoots = [];
+  if (rootGrantsPath) {
+    try {
+      grantRoots = (await loadRootGrants({ path: rootGrantsPath, publicKeyX: guardPublicKeyX, spokeDeviceId: deviceId, now: now() })).roots;
+    } catch { grantRoots = []; }
+  }
+  return cleanScopeSummary({
+    tier: deriveScopeTier({ roots, grantRoots, scopePick }),
+    roots: [...roots],
+    grants: grantRoots,
+  });
+}
+
+async function detectCapabilities(fetchImpl) {
+  const caps = ['local-files'];
+  if (platform() === 'win32') caps.push('powershell', 'pc-browser');
+  // The phone capability means the Android bridge answers on this PC; an
+  // actually-connected phone is a per-call question (phone-status).
+  const adb = await run('adb', ['version'], { timeoutMs: 5000 }).catch(() => ({ ok: false }));
+  if (adb.ok) caps.push('phone');
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    const r = await fetchImpl('http://127.0.0.1:11434/api/tags', { signal: ctrl.signal });
+    clearTimeout(t);
+    if (r.ok) caps.push('ollama');
+  } catch {}
+  return caps;
+}
+
+/** Long-poll loop. Returns { stop }. */
+export function startSpoke({ config, fetchImpl = fetch, log = (...a) => console.log('[hands-spoke]', ...a), executor, scopeProvider = null } = {}) {
+  const roots = config.roots?.length ? config.roots : [process.env.HELMIAN_ROOT || process.cwd()];
+  const deviceId = config.deviceId || defaultSpokeDeviceId();
+  const rootGrantsPath = config.rootGrantsPath || defaultRootGrantsPath();
+  const exec = executor || createExecutor({ roots, rootGrantsPath, rootGrantDeviceId: deviceId, guardPublicKeyX: config.guardPublicKeyX || null, guardDeviceId: config.guardDeviceId || 'hands-mcp', fetchImpl, usedDecisionsPath: config.usedDecisionsPath || defaultUsedDecisionsPath() });
+  let stopped = false;
+  let ctrl = null;
+  let caps = null;
+  let capsAt = 0;
+  // Scope summary for poll presence (bite 1). Rebuilt for every poll — the
+  // grants load is the same verified load the executor runs per file
+  // operation, so a grant or revocation shows in the next report, never a
+  // stale one. A failed build polls WITHOUT a scope field: reporting must
+  // never become a reason polling breaks.
+  const provideScope = scopeProvider || (() => buildScopeSummary({ roots, rootGrantsPath, guardPublicKeyX: config.guardPublicKeyX || null, deviceId, scopePick: config.scope ?? null }));
+  const post = (path, body, signal) => fetchImpl(`${config.url}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${config.token}` }, body: JSON.stringify(body), signal });
+
+  (async () => {
+    const grantState = await loadRootGrants({ path: rootGrantsPath, publicKeyX: config.guardPublicKeyX || null, spokeDeviceId: deviceId }).catch((e) => ({ grants: [], rejected: [{ error: e.message }] }));
+    const grantSummary = grantState.grants.length
+      ? `; granted read-only roots: ${grantState.grants.map((g) => g.rootPath).join(', ')}`
+      : '; no root grants';
+    const rejectedSummary = grantState.rejected.length ? `; ${grantState.rejected.length} grant(s) rejected (${grantState.rejected.map((r) => r.error).join('; ')})` : '';
+    log(`connected to ${config.url} as ${deviceId}; roots: ${roots.join(', ')}${grantSummary}${rejectedSummary}; mutating: ${config.guardPublicKeyX ? 'Guard-verified' : 'refused (no Guard key pinned)'}`);
+    let backoff = 1000;
+    while (!stopped) {
+      try {
+        if (!caps || Date.now() - capsAt > 300000) { caps = await detectCapabilities(fetchImpl); capsAt = Date.now(); }
+        const pollScope = await provideScope().catch(() => null);
+        // stop() may have landed during the scope build: a stopped loop must
+        // never post again (a late poll parks server-side and can steal a job
+        // meant for a live spoke). The check and the post below are in the
+        // same synchronous run, so nothing can slip between them.
+        if (stopped) break;
+        ctrl = new AbortController();
+        const res = await post('/spoke/v1/poll', { deviceId, capabilities: caps, ...(pollScope ? { scope: pollScope } : {}) }, ctrl.signal);
+        if (res.status === 401) { log('the hands server rejected this PC (401). Re-pair with: node bin/hands-spoke.mjs pair'); await new Promise((r) => setTimeout(r, 60000)); continue; }
+        if (!res.ok) throw new Error(`poll ${res.status}`);
+        const { job } = await res.json();
+        backoff = 1000;
+        if (!job) continue;
+        log(`job ${job.id}: ${job.tool}`);
+        const result = await exec.execute(job);
+        log(`job ${job.id}: ${result.ok ? 'done' : `refused/failed: ${result.error}`}`);
+        await post('/spoke/v1/result', { jobId: job.id, ...result });
+      } catch (e) {
+        if (stopped) break;
+        log(`connection problem (${e.message}); retrying in ${backoff / 1000}s`);
+        await new Promise((r) => setTimeout(r, backoff));
+        backoff = Math.min(backoff * 2, 60000);
+      }
+    }
+  })();
+
+  return { stop() { stopped = true; try { ctrl?.abort(); } catch {} } };
+}
+
+/** Exchange the hands passphrase for a spoke token and save the local config. */
+export async function pairSpoke({ url = DEFAULT_HANDS_URL, passphrase, pairCode, roots, configPath = defaultConfigPath(), fetchImpl = fetch, deviceId = defaultSpokeDeviceId() }) {
+  const res = await fetchImpl(`${url}/spoke/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(pairCode ? { pairCode, deviceId } : { passphrase, deviceId }) });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.token) throw new Error(body.error || `pairing failed (${res.status})`);
+  const existing = (await readSpokeConfig(configPath)) || {};
+  const cfg = { ...existing, url, token: body.token, deviceId, roots: roots?.length ? roots : existing.roots || [], pairedAt: new Date().toISOString() };
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(configPath, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  return { configPath, deviceId, roots: cfg.roots };
+}

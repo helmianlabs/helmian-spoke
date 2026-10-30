@@ -1,0 +1,60 @@
+# Copy to .github/workflows/release.yml (needs a token with the "workflow" scope).
+# Builds the Windows installer from source on a tag, then submits it to SignPath.
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+env:
+  NODE_VERSION: '24.22.1'
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}' }
+      - run: npm run check
+      - name: Stage spoke tree
+        shell: pwsh
+        run: |
+          $s = 'spoke-installer/stage'
+          New-Item -ItemType Directory -Force "$s/bin","$s/src/hands","$s/hands-mcp/src/shared" | Out-Null
+          Invoke-WebRequest "https://nodejs.org/dist/v$env:NODE_VERSION/win-x64/node.exe" -OutFile "$s/node.exe"
+          Copy-Item bin/hands-spoke.mjs "$s/bin/"
+          Copy-Item src/hands/*.mjs "$s/src/hands/"
+          Copy-Item hands-mcp/src/shared/protocol.mjs "$s/hands-mcp/src/shared/"
+          Copy-Item package.json, LICENSE, PRIVACY.md "$s/"
+          Copy-Item spoke-installer/install-pair.mjs "$s/"
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" spoke-installer/HelmianSpoke.iss
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: spoke-installer/output/*.exe
+      - name: Sign with SignPath
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'helmian-spoke'
+          signing-policy-slug: 'release-signing'
+          github-artifact-id: '${{ steps.upload.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed'
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            signed/*.exe
+            spoke-installer/output/*.exe
