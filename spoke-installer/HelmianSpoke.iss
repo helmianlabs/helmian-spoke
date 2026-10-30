@@ -10,14 +10,14 @@
 [Setup]
 AppId={{EEE4DDE3-DB3E-453E-B88D-0C9146ECA332}
 AppName=Helmian Spoke
-AppVersion=1.0.4
+AppVersion=1.0.5
 AppPublisher=Helmian Labs
 DefaultDirName={localappdata}\Programs\HelmianSpoke
 DefaultGroupName=Helmian Spoke
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=output
-OutputBaseFilename=Helmian-Spoke-Setup-1.0.4-win-x64
+OutputBaseFilename=Helmian-Spoke-Setup-1.0.5-win-x64
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -81,7 +81,7 @@ begin
   if CurStep = ssPostInstall then
   begin
     SetEnvironmentVariable('HELMIAN_HANDS_PASSPHRASE', PairPage.Values[0]);
-    SetEnvironmentVariable('HELMIAN_SPOKE_ROOTS', ExpandConstant('{userprofile}'));
+    SetEnvironmentVariable('HELMIAN_SPOKE_ROOTS', ExpandConstant('{%USERPROFILE}'));
     Exec(ExpandConstant('{app}\node.exe'), ExpandConstant('"{app}\install-pair.mjs"'),
       ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
