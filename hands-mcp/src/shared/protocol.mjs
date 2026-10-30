@@ -34,16 +34,33 @@ export const sha256Hex = (text) => createHash('sha256').update(String(text), 'ut
 // needs           => compute-routing capabilities (src/core/compute-routing.mjs)
 
 export const POWERSHELL_COMMANDS = Object.freeze({
-  'git-status': { args: { repo: 'path' }, summary: 'git status of a repo' },
-  'git-log': { args: { repo: 'path', count: 'int' }, summary: 'recent git commits of a repo' },
-  'disk-free': { args: {}, summary: 'free disk space per drive' },
-  'list-processes': { args: {}, summary: 'top 20 processes by CPU' },
-  'ollama-list': { args: {}, summary: 'installed Ollama models' },
+  'git-status': { readOnly: true, args: { repo: 'path' }, summary: 'git status of a repo' },
+  'git-log': { readOnly: true, args: { repo: 'path', count: 'int' }, summary: 'recent git commits of a repo' },
+  'disk-free': { readOnly: true, args: {}, summary: 'free disk space per drive' },
+  'list-processes': { readOnly: true, args: {}, summary: 'top 20 processes by CPU' },
+  'ollama-list': { readOnly: true, args: {}, summary: 'installed Ollama models' },
   'restart-bridge': { args: {}, summary: 'restart the Helmian Bridge service (its in-process spoke re-reads its config)' },
-  'toolchain-versions': { args: {}, summary: 'node, npm, npx and eas versions on the PC' },
+  'toolchain-versions': { readOnly: true, args: {}, summary: 'node, npm, npx and eas versions on the PC' },
   'eas-build': { args: { repo: 'path' }, summary: 'start an EAS Android preview build in a repo (detached; output logged in the repo)' },
-  'eas-build-status': { args: { repo: 'path' }, summary: 'tail of the latest spoke-started EAS build log in a repo, with its exit marker' },
+  'eas-build-status': { readOnly: true, args: { repo: 'path' }, summary: 'tail of the latest spoke-started EAS build log in a repo, with its exit marker' },
 });
+
+// Read-only allow-list (Troy, 2026-10-30: "if it's read-only, the user doesn't
+// need to click"). A run_powershell call whose commandId is flagged readOnly
+// above only LOOKS at the PC (status, logs, versions, free space), so it skips
+// the Executive Guard approval. Everything else (restart-bridge, eas-build,
+// every write/move/copy/delete/open_url/phone change) still needs a human
+// Guard approval. Both the hub and the PC spoke use this one check.
+export const POWERSHELL_READ_COMMANDS = Object.freeze(Object.keys(POWERSHELL_COMMANDS).filter((id) => POWERSHELL_COMMANDS[id].readOnly === true));
+// Capability a spoke reports when it runs read-only allow-listed commands
+// without a Guard decision. Older spokes don't report it, so the hub keeps
+// asking Guard for them (they would refuse an unsigned run_powershell job).
+export const POWERSHELL_READ_CAPABILITY = 'powershell-read';
+
+/** True only for a validated run_powershell call to a readOnly allow-listed command. */
+export function isReadOnlyCall(tool, args) {
+  return tool === 'run_powershell' && typeof args?.commandId === 'string' && POWERSHELL_READ_COMMANDS.includes(args.commandId);
+}
 
 // The phone family (Broad Spectrum Spoke, phone commands added 2026-10-26):
 // fixed, narrow commands for a screen-by-screen pass over the Android phone
@@ -73,7 +90,7 @@ export const TOOLS = Object.freeze({
   ollama_generate: { mutating: false, needs: ['ollama'], description: 'Ask a local Ollama model on the PC. Free local compute; nothing leaves the PC except the answer.' },
   run_powershell: { mutating: true, needs: ['powershell'], description: 'Run ONE allow-listed command by id (never free text). Needs a human Guard approval.' },
   open_url: { mutating: true, needs: ['pc-browser'], description: 'Open an https URL in the PC browser. Needs a human Guard approval.' },
-  write_file: { mutating: true, needs: ['local-files'], description: 'Write a text file inside the PC workspace roots. Needs a human Guard approval.' },
+  write_file: { mutating: true, needs: ['local-files'], description: 'Save a plain-text file (a draft page, notes, a report) into a folder the owner already allowed on their own device. Replaces that file if it exists. The owner approves each save in Executive Guard.' },
   move_file: { mutating: true, needs: ['local-files'], description: 'Move or rename a file or folder inside the PC workspace roots. Refuses if the destination already exists. Needs a human Guard approval.' },
   copy_file: { mutating: true, needs: ['local-files'], description: 'Copy a file or folder inside the PC workspace roots. Refuses if the destination already exists. Needs a human Guard approval.' },
   delete_file: { mutating: true, needs: ['local-files'], description: 'Delete a file inside the PC workspace roots; a folder needs recursive: true. Needs a human Guard approval.' },

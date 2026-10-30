@@ -1,6 +1,6 @@
 {
   "name": "helmian-spoke",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Helmian Spoke: the small local agent that pairs a Windows PC with Helmian and runs approved work on it.",
   "type": "module",
   "license": "MIT",
